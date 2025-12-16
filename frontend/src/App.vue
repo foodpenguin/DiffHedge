@@ -1,5 +1,12 @@
 <script setup>
 import { ref, reactive, onMounted, markRaw } from 'vue'
+import { Buffer } from 'buffer'
+import * as bitcoin from 'bitcoinjs-lib'
+import * as ecc from 'tiny-secp256k1'
+
+// Initialize bitcoinjs-lib
+bitcoin.initEccLib(ecc)
+window.Buffer = Buffer
 
 const API_BASE = 'http://localhost:8000/api'
 
@@ -32,6 +39,8 @@ const currentContract = reactive({
   tx_hex: '',
   logs: []
 })
+
+const userContracts = ref([])
 
 const settleForm = reactive({
   difficulty: 0.06
@@ -121,6 +130,7 @@ const connectWallet = async () => {
     }
 
     fetchStats()
+    fetchUserContracts()
   } catch (e) {
     log(`連接失敗: ${e.message}`)
   }
@@ -273,29 +283,121 @@ const signAndBroadcast = async () => {
   
   try {
     log('正在請求錢包簽名...')
-    // 注意: Unisat/OKX 通常需要 PSBT。這裡我們嘗試直接簽名或提示用戶。
-    // 由於後端回傳的是 Raw Hex (部分簽名)，若錢包不支援直接簽 Raw Hex，
-    // 則需要前端引入 bitcoinjs-lib 將其包裝成 PSBT。
-    // 這裡為了演示流程，我們先顯示 Hex。
     
-    console.log("Partial TX Hex:", currentContract.tx_hex)
+    // 1. Parse the partial transaction
+    const tx = bitcoin.Transaction.fromHex(currentContract.tx_hex)
     
-    if (wallet.name.includes('UniSat')) {
-        try {
-            // 嘗試使用 signPsbt (需要先轉 PSBT，這裡可能會失敗如果格式不對)
-            // 或是 signMessage (不適用)
-            alert("請複製 Console 中的 Hex，使用支援 Raw Taproot 簽名的工具完成簽名並廣播。")
-        } catch (e) {
-            log("簽名請求失敗: " + e.message)
-        }
-    } else {
-        alert("請複製 Console 中的 Hex，使用支援 Raw Taproot 簽名的工具完成簽名並廣播。")
+    // 2. Extract Witness Data
+    const witness = tx.ins[0].witness
+    // Expecting: [SigOrPlaceholder, SigOrPlaceholder, Script, ControlBlock]
+    const script = witness[witness.length - 2]
+    const controlBlock = witness[witness.length - 1]
+    
+    // 3. Construct PSBT for signing
+    const psbt = new bitcoin.Psbt({ network: bitcoin.networks.testnet })
+    
+    const value = currentContract.amount * 2
+    const scriptPubKey = bitcoin.address.toOutputScript(currentContract.address, bitcoin.networks.testnet)
+    
+    psbt.addInput({
+        hash: tx.ins[0].hash,
+        index: tx.ins[0].index,
+        witnessUtxo: {
+            script: scriptPubKey,
+            value: value
+        },
+        tapLeafScript: [{
+            leafVersion: 0xc0,
+            script: script,
+            controlBlock: controlBlock
+        }],
+        sighashType: bitcoin.Transaction.SIGHASH_DEFAULT
+    })
+    
+    psbt.addOutput({
+        address: bitcoin.address.fromOutputScript(tx.outs[0].script, bitcoin.networks.testnet),
+        value: tx.outs[0].value
+    })
+    
+    // 4. Request Signature
+    const psbtHex = psbt.toHex()
+    const signedPsbtHex = await window.unisat.signPsbt(psbtHex)
+    
+    // 5. Extract Signature
+    const signedPsbt = bitcoin.Psbt.fromHex(signedPsbtHex)
+    const tapScriptSig = signedPsbt.data.inputs[0].tapScriptSig
+    
+    if (!tapScriptSig || tapScriptSig.length === 0) {
+        throw new Error("No signature returned from wallet")
     }
     
-    log(`待簽名 Hex 已輸出至 Console`)
+    const userSig = tapScriptSig[0].signature
+    
+    // 6. Insert Signature into Witness Stack
+    let inserted = false
+    for (let i = 0; i < witness.length - 2; i++) {
+        if (witness[i].length === 0) {
+            witness[i] = userSig
+            inserted = true
+            break
+        }
+    }
+    
+    if (!inserted) {
+        throw new Error("Could not find placeholder for signature in witness stack")
+    }
+    
+    // 7. Broadcast
+    const finalTxHex = tx.toHex()
+    log("簽名完成，正在廣播...")
+    
+    const txid = await window.unisat.pushTx(finalTxHex)
+    log(`廣播成功! TXID: ${txid}`)
+    
+    currentContract.status = 'SETTLED_WIN'
     
   } catch (e) {
-    log(`操作失敗: ${e.message}`)
+    log(`簽名/廣播失敗: ${e.message}`)
+    console.error(e)
+  }
+}
+
+// 10. Fetch User Contracts
+const fetchUserContracts = async () => {
+  if (!wallet.publicKey) return
+  try {
+    const res = await fetch(`${API_BASE}/contracts/user/${wallet.publicKey}`)
+    const data = await res.json()
+    userContracts.value = data.contracts
+    log(`已載入 ${data.count} 筆歷史合約`)
+  } catch (e) {
+    log(`載入歷史合約失敗: ${e.message}`)
+  }
+}
+
+// 11. Claim All
+const claimAll = async () => {
+  if (!wallet.publicKey) return
+  try {
+    log('正在請求批量領取...')
+    const res = await fetch(`${API_BASE}/claim_all`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_pubkey: wallet.publicKey })
+    })
+    const data = await res.json()
+    
+    if (data.status === 'error') {
+        log(`批量領取失敗: ${data.message}`)
+        return
+    }
+    
+    log(`批量交易已建立! 請簽名。`)
+    console.log("Batch TX Hex:", data.tx_hex)
+    alert("批量交易 Hex 已輸出至 Console，請使用工具簽名並廣播。")
+    
+  } catch (e) {
+    log(`批量領取請求錯誤: ${e.message}`)
   }
 }
 
@@ -364,6 +466,23 @@ const signAndBroadcast = async () => {
       </div>
     </div>
 
+    <!-- 4. History & Batch Claim -->
+    <div class="card" v-if="wallet.connected">
+      <h2>4. 歷史合約與批量領取</h2>
+      <button @click="fetchUserContracts" class="btn-info">重新整理列表</button>
+      <button @click="claimAll" class="btn-success">批量領取所有獲勝合約 (Claim All)</button>
+      
+      <div class="history-list">
+        <div v-for="c in userContracts" :key="c.id" class="history-item">
+            <span>ID: {{ c.id }}</span>
+            <span>{{ c.direction }}</span>
+            <span>{{ c.amount }} sats</span>
+            <span :class="'status-' + c.status">{{ c.status }}</span>
+            <button v-if="c.status === 'WAITING_USER_SIG'" @click="() => { currentContract.id = c.id; currentContract.tx_hex = c.tx_hex; currentContract.status = c.status; signAndBroadcast() }">簽名</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Logs -->
     <div class="card logs">
       <h2>操作日誌</h2>
@@ -427,4 +546,22 @@ button {
 .btn-success { background-color: #28a745; color: white; border: none; }
 .btn-danger { background-color: #dc3545; color: white; border: none; }
 .btn-info { background-color: #17a2b8; color: white; border: none; }
+
+.history-list {
+    margin-top: 15px;
+    max-height: 300px;
+    overflow-y: auto;
+}
+.history-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px;
+    border-bottom: 1px solid #eee;
+    align-items: center;
+}
+.status-PENDING { color: orange; }
+.status-MATCHED { color: blue; }
+.status-SETTLED_LOSS { color: red; }
+.status-WAITING_USER_SIG { color: green; font-weight: bold; }
+.status-SETTLED_WIN { color: green; }
 </style>

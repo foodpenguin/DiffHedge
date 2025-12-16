@@ -10,6 +10,8 @@ import secrets
 import traceback
 import hashlib
 from dotenv import load_dotenv
+import time
+import asyncio
 
 from bitcoinutils.setup import setup
 from bitcoinutils.keys import PrivateKey, PublicKey, P2wshAddress, P2wpkhAddress, P2trAddress
@@ -24,10 +26,44 @@ from contextlib import asynccontextmanager
 setup('testnet') 
 load_dotenv() 
 
+async def auto_settle_all(difficulty):
+    contracts = db_get_pending_contracts()
+    if not contracts: return
+    print(f"Auto-settling {len(contracts)} contracts with difficulty {difficulty}...")
+    for contract in contracts:
+        await execute_settlement(contract, difficulty)
+
+async def background_monitor():
+    last_block_hash = ""
+    print("Background monitor started.")
+    while True:
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get("https://mempool.space/signet/api/blocks/tip/hash")
+                if resp.status_code == 200:
+                    current_hash = resp.text
+                    if last_block_hash and current_hash != last_block_hash:
+                        print(f"New block detected: {current_hash}")
+                        # Calculate difficulty
+                        seed = int(current_hash[-4:], 16)
+                        normalized = seed / 65535.0 
+                        difficulty = 0.01 + (normalized * 0.08)
+                        difficulty = round(difficulty, 4)
+                        
+                        print(f"New Difficulty: {difficulty}. Triggering Auto-Settlement...")
+                        await auto_settle_all(difficulty)
+                        
+                    last_block_hash = current_hash
+        except Exception as e:
+            print(f"Monitor Error: {e}")
+            
+        await asyncio.sleep(60)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     init_db()
+    asyncio.create_task(background_monitor())
     yield
     # Shutdown (if needed)
 
@@ -110,27 +146,48 @@ def init_db():
             direction TEXT NOT NULL,
             status TEXT DEFAULT 'PENDING',
             tx_hex TEXT,
-            nonce TEXT
+            nonce TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            block_height INTEGER
         )
     ''')
+    # 嘗試為舊資料庫新增欄位 (如果不存在)
     try:
         c.execute("ALTER TABLE contracts ADD COLUMN nonce TEXT")
     except sqlite3.OperationalError:
         pass
+    try:
+        c.execute("ALTER TABLE contracts ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE contracts ADD COLUMN block_height INTEGER")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
 
-def db_create_contract(user_pub, address, script_hex, amount, direction, nonce):
+def db_create_contract(user_pub, address, script_hex, amount, direction, nonce, block_height):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute('''
-        INSERT INTO contracts (user_pubkey, deposit_address, redeem_script_hex, amount, direction, nonce)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (user_pub, address, script_hex, amount, direction, nonce))
+        INSERT INTO contracts (user_pubkey, deposit_address, redeem_script_hex, amount, direction, nonce, block_height)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (user_pub, address, script_hex, amount, direction, nonce, block_height))
     order_id = c.lastrowid
     conn.commit()
     conn.close()
     return order_id
+
+def db_get_pending_contracts():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM contracts WHERE status IN ('PENDING', 'WAITING_USER_SIG')")
+    rows = c.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
 
 def db_get_contract(order_id):
     conn = sqlite3.connect(DB_NAME)
@@ -140,6 +197,16 @@ def db_get_contract(order_id):
     row = c.fetchone()
     conn.close()
     return dict(row) if row else None
+
+def db_get_contracts_by_user(user_pubkey):
+    """ 根據用戶公鑰查詢所有合約 """
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM contracts WHERE user_pubkey = ? ORDER BY id DESC", (user_pubkey,))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
 
 def db_update_status(order_id, status, tx_hex=None):
     conn = sqlite3.connect(DB_NAME)
@@ -534,12 +601,106 @@ async def build_refund_tx(contract):
 
     return tx.serialize(), msg
 
+async def build_batch_win_tx(user_pubkey):
+    """ 構建批量領取交易 (Batch Claim) """
+    # 1. 找出該用戶所有等待簽名的合約
+    contracts = db_get_contracts_by_user(user_pubkey)
+    waiting_contracts = [c for c in contracts if c['status'] == 'WAITING_USER_SIG']
+    
+    if not waiting_contracts:
+        return None, "No waiting contracts found"
+
+    # 2. 準備 Inputs
+    tx_inputs = []
+    total_in = 0
+    input_details = [] # 用來暫存每個 Input 對應的簽名資訊
+    
+    # 假設所有合約都匯款到同一個 User Address (由 Pubkey 衍生)
+    user_addr_obj = PublicKey(user_pubkey).get_segwit_address()
+    
+    for contract in waiting_contracts:
+        utxos = await get_utxos(contract['deposit_address'])
+        if not utxos: continue 
+        
+        # 重建該合約的 Tree 與 Script
+        tree, script_win, _, _ = create_contract_tree(
+            contract['user_pubkey'], HOUSE_PUB_KEY_HEX, ORACLE_PUB_KEY_HEX, contract['nonce']
+        )
+        
+        # 計算該合約的 Tweaked Pubkey (用於 Script Pubkey)
+        internal_pub = PublicKey(NUMS_PUBKEY_HEX)
+        internal_pub_bytes = internal_pub.to_bytes()
+        root_hash = get_tag_hashed_merkle_root(tree)
+        tweak = int.from_bytes(root_hash, 'big')
+        tweaked_pubkey, parity = tweak_taproot_pubkey(internal_pub_bytes, tweak)
+        
+        tr_addr = P2trAddress(witness_program=tweaked_pubkey[:32].hex())
+        utxo_script_pubkey = tr_addr.to_script_pub_key()
+        
+        # 取得 Win 分支的 Control Block
+        cb = ControlBlock(internal_pub, tree, 0, is_odd=(parity == 1))
+        
+        for utxo in utxos:
+            tx_inputs.append(TxInput(utxo['txid'], utxo['vout']))
+            total_in += utxo['value']
+            # 儲存簽名所需的資訊
+            input_details.append({
+                'amount': utxo['value'],
+                'script_pubkey': utxo_script_pubkey,
+                'script_win': script_win,
+                'control_block': cb
+            })
+
+    if not tx_inputs:
+        return None, "No funds found in waiting contracts"
+
+    # 3. 計算手續費與輸出
+    # 估算: 每個 Input 約 150 vbytes (Taproot Script Path) + Overhead
+    est_vbytes = (len(tx_inputs) * 150) + 31 + 11
+    fee = int(est_vbytes * 2.0)
+    send_amount = total_in - fee
+    
+    if send_amount <= 0:
+        return None, "Insufficient funds for fee"
+        
+    tx_output = TxOutput(send_amount, user_addr_obj.to_script_pub_key())
+    tx = Transaction(tx_inputs, [tx_output], has_segwit=True)
+    
+    # 4. 對每個 Input 進行 Oracle 簽名
+    user_x = to_x_only(user_pubkey)
+    oracle_x = to_x_only(ORACLE_PUB_KEY_HEX)
+    pubkeys = sorted([user_x, oracle_x])
+    
+    for i, detail in enumerate(input_details):
+        # Oracle 簽名
+        sig_oracle = ORACLE_PRIV_KEY.sign_taproot_input(
+            tx, i, [detail['script_pubkey']], [detail['amount']],
+            script_path=True, tapleaf_script=detail['script_win'], tweak=False
+        )
+        
+        sigs_map = { oracle_x: sig_oracle }
+        
+        witness_stack = []
+        for pk in reversed(pubkeys):
+            if pk in sigs_map:
+                witness_stack.append(sigs_map[pk])
+            else:
+                witness_stack.append("") # User 簽名留空
+                
+        witness_elements = witness_stack + [detail['script_win'].to_hex(), detail['control_block'].to_hex()]
+        tx.witnesses.append(TxWitnessInput(witness_elements))
+        
+    return tx.serialize(), f"Batch transaction for {len(waiting_contracts)} contracts created."
+
 # --- 4. API 介面 ---
 
 class ContractRequest(BaseModel):
     user_pubkey: str  # 前端必須傳來 User 的公鑰 (Hex)
     amount: int
     direction: str
+
+class ClaimAllRequest(BaseModel):
+    user_pubkey: str
 
 class SettleRequest(BaseModel):
     contract_id: int
@@ -555,11 +716,28 @@ class CancelRequest(BaseModel):
     contract_id: int
 
 @app.get("/api/stats")
-def stats():
+async def stats():
     # 顯示 House 地址，方便您打入測試幣
     house_addr = HOUSE_PRIV_KEY.get_public_key().get_segwit_address().to_string()
+    
+    # Dynamic Difficulty based on Signet Block Hash
+    difficulty = 0.047 # Default
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get("https://mempool.space/signet/api/blocks/tip/hash")
+            if resp.status_code == 200:
+                block_hash = resp.text
+                # Use last 4 hex chars to generate a float 0.0-1.0
+                seed = int(block_hash[-4:], 16)
+                # Normalize to range 0.01 - 0.09 (Target is usually around 0.05)
+                normalized = seed / 65535.0 
+                difficulty = 0.01 + (normalized * 0.08)
+                difficulty = round(difficulty, 4)
+    except:
+        pass
+
     return {
-        "difficulty": 0.047, 
+        "difficulty": difficulty, 
         "hashprice_sats": 220000.0,
         "house_address": house_addr
     }
@@ -571,16 +749,49 @@ def get_contract_api(contract_id: int):
         raise HTTPException(status_code=404, detail="Contract not found")
     return contract
 
+@app.get("/api/contracts/user/{user_pubkey}")
+def get_user_contracts(user_pubkey: str):
+    """ 獲取特定用戶的所有合約 """
+    contracts = db_get_contracts_by_user(user_pubkey)
+    return {
+        "count": len(contracts),
+        "contracts": contracts
+    }
+
+@app.post("/api/claim_all")
+async def claim_all_wins(req: ClaimAllRequest):
+    """ 批量領取所有獲勝合約 """
+    try:
+        tx_hex, msg = await build_batch_win_tx(req.user_pubkey)
+        if not tx_hex:
+             return {"status": "error", "message": msg}
+             
+        return {
+            "status": "ready_to_sign",
+            "tx_hex": tx_hex,
+            "message": msg
+        }
+    except Exception as e:
+        print(traceback.format_exc())
+        return {"status": "error", "error": str(e)}
+
 @app.post("/api/create_contract")
-def create_contract(req: ContractRequest):
+async def create_contract(req: ContractRequest):
     # 生成隨機 Nonce (4 bytes)
     nonce_hex = secrets.token_hex(4)
 
     # 1. 根據 User 公鑰生成 2-of-3 地址
     address, script_hex = create_2of3_address(req.user_pubkey, nonce_hex)
     
-    # 2. 存入 DB
-    contract_id = db_create_contract(req.user_pubkey, address, script_hex, req.amount, req.direction, nonce_hex)
+    # 2. 獲取當前區塊高度
+    try:
+        status_info = await get_time_since_last_block()
+        block_height = status_info['block_height']
+    except:
+        block_height = 0 # Fallback if API fails
+
+    # 3. 存入 DB
+    contract_id = db_create_contract(req.user_pubkey, address, script_hex, req.amount, req.direction, nonce_hex, block_height)
     
     return {
         "status": "success",
@@ -693,6 +904,28 @@ class SettleAllRequest(BaseModel):
 
 async def execute_settlement(contract, current_difficulty):
     """ 執行單一合約結算邏輯 """
+    
+    # --- FIX START: 防止狀態翻轉 (Decision Locking) ---
+    # 如果狀態已經是 WAITING_USER_SIG，代表 Oracle 之前已經判定 User 贏了。
+    # 此時不應該再根據新的 difficulty 重新判斷，而是直接回傳之前的結果，讓用戶繼續簽名。
+    if contract['status'] == 'WAITING_USER_SIG':
+        # 確保有 tx_hex
+        tx_hex = contract['tx_hex']
+        if not tx_hex:
+            # 如果資料庫沒存到，重新生成一次 Win TX (基於合約參數，結果是一樣的)
+            user_addr_obj = PublicKey(contract['user_pubkey']).get_segwit_address()
+            tx_hex = await build_win_path_partial_tx(contract, user_addr_obj)
+            # 更新回 DB
+            db_update_status(contract['id'], 'WAITING_USER_SIG', tx_hex)
+
+        msg = "Oracle already signed (Locked). Waiting for User signature."
+        return {
+            "result": "WAITING_USER_SIG", 
+            "tx_hex": tx_hex,
+            "message": msg
+        }
+    # --- FIX END ---
+
     # 防止重複結算 (允許 WAITING_USER_SIG 狀態重試，以便更新手續費或重新獲取)
     if contract['status'] not in ['PENDING', 'WAITING_USER_SIG']: 
         return {"result": "ALREADY_SETTLED", "message": f"Contract is {contract['status']}"}
@@ -795,6 +1028,36 @@ async def settle_all_contracts(req: SettleAllRequest):
         results.append({"id": contract['id'], "result": res})
             
     return {"summary": results, "count": len(results)}
+
+@app.get("/api/last-block-time")
+async def get_time_since_last_block():
+    try:
+        async with httpx.AsyncClient() as client:
+            # 1. 獲取最新區塊列表 (通常第一個就是最新的)
+            response = await client.get(f"https://mempool.space/signet/api/blocks")
+            
+            if response.status_code != 200:
+                raise HTTPException(status_code=502, detail="無法連接外部 API")
+            
+            blocks = response.json()
+            latest_block = blocks[0]
+            
+            # 2. 獲取時間戳
+            last_block_time = latest_block['timestamp']
+            
+            # 3. 計算差距
+            current_time = int(time.time())
+            seconds_elapsed = current_time - last_block_time
+            
+            return {
+                "network": "Bitcoin Signet",
+                "block_height": latest_block['height'],
+                "seconds_since_mined": seconds_elapsed,
+                "formatted_time": f"{seconds_elapsed} seconds ago"
+            }
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
