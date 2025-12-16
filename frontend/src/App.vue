@@ -280,9 +280,11 @@ const checkStatus = async () => {
 // 9. Sign & Broadcast (User Win)
 const signAndBroadcast = async () => {
   if (!currentContract.tx_hex) return alert('No transaction to sign')
+  if (!currentContract.address) return alert('Contract address missing')
   
   try {
     log('正在請求錢包簽名...')
+    console.log("Contract Address:", currentContract.address)
     
     // 1. Parse the partial transaction
     const tx = bitcoin.Transaction.fromHex(currentContract.tx_hex)
@@ -296,8 +298,15 @@ const signAndBroadcast = async () => {
     // 3. Construct PSBT for signing
     const psbt = new bitcoin.Psbt({ network: bitcoin.networks.testnet })
     
-    const value = currentContract.amount * 2
-    const scriptPubKey = bitcoin.address.toOutputScript(currentContract.address, bitcoin.networks.testnet)
+    const value = BigInt(currentContract.amount * 2)
+    // Ensure address is valid for testnet
+    let scriptPubKey
+    try {
+        scriptPubKey = bitcoin.address.toOutputScript(currentContract.address, bitcoin.networks.testnet)
+    } catch (err) {
+        console.error("Address Error:", err)
+        throw new Error(`Invalid address for Testnet: ${currentContract.address}`)
+    }
     
     psbt.addInput({
         hash: tx.ins[0].hash,
@@ -392,12 +401,80 @@ const claimAll = async () => {
         return
     }
     
-    log(`批量交易已建立! 請簽名。`)
-    console.log("Batch TX Hex:", data.tx_hex)
-    alert("批量交易 Hex 已輸出至 Console，請使用工具簽名並廣播。")
+    log(`批量交易已建立! 正在組裝 PSBT...`)
+    console.log("Unsigned TX Hex:", data.unsigned_tx_hex)
+    
+    if (!data.unsigned_tx_hex) {
+        throw new Error("Backend returned empty transaction hex")
+    }
+
+    // 1. 從未簽名交易建立 PSBT
+    const tx = bitcoin.Transaction.fromHex(data.unsigned_tx_hex)
+    const psbt = new bitcoin.Psbt({ network: bitcoin.networks.testnet })
+    
+    // 2. 根據後端指示加入 Inputs
+    for (const inputData of data.psbt_inputs) {
+        const i = inputData.index
+        
+        // A. 加入基本 Input 資訊
+        psbt.addInput({
+            hash: tx.ins[i].hash,
+            index: tx.ins[i].index,
+            witnessUtxo: {
+                script: Buffer.from(inputData.scriptPubKey, 'hex'),
+                value: BigInt(inputData.value)
+            },
+            tapLeafScript: [{
+                leafVersion: inputData.tapLeafScript.leafVersion,
+                script: Buffer.from(inputData.tapLeafScript.script, 'hex'),
+                controlBlock: Buffer.from(inputData.tapLeafScript.controlBlock, 'hex')
+            }]
+        })
+        
+        // B. 加入 Oracle 的簽名 (TapScriptSig)
+        // 注意: 這裡我們直接把 Oracle 簽名放進去，Unisat 簽名時會保留它
+        psbt.updateInput(i, {
+            tapScriptSig: [{
+                pubkey: Buffer.from(inputData.oracleSig.pubkey, 'hex'),
+                signature: Buffer.from(inputData.oracleSig.signature, 'hex'),
+                leafHash: Buffer.from(inputData.oracleSig.leafHash, 'hex')
+            }]
+        })
+    }
+    
+    // 3. 加入 Outputs
+    tx.outs.forEach(out => {
+        psbt.addOutput({
+            script: out.script,
+            value: out.value
+        })
+    })
+    
+    log("PSBT 組裝完成，請求錢包簽名...")
+    
+    // 4. 請求 Unisat 簽名 (用戶簽名)
+    const psbtHex = psbt.toHex()
+    const signedPsbtHex = await window.unisat.signPsbt(psbtHex)
+    
+    // 5. 廣播 (Unisat signPsbt 回傳的通常是已簽名的 PSBT Hex)
+    // 我們需要提取最終交易並廣播
+    const signedPsbt = bitcoin.Psbt.fromHex(signedPsbtHex)
+    
+    // 嘗試 Finalize (合併簽名)
+    // 由於我們已經提供了 Oracle 簽名，且 Unisat 提供了 User 簽名，
+    // bitcoinjs-lib 應該能自動完成 Finalize
+    signedPsbt.finalizeAllInputs()
+    
+    const finalTx = signedPsbt.extractTransaction()
+    const finalTxHex = finalTx.toHex()
+    
+    log("簽名完成，正在廣播...")
+    const txid = await window.unisat.pushTx(finalTxHex)
+    log(`批量領取成功! TXID: ${txid}`)
     
   } catch (e) {
-    log(`批量領取請求錯誤: ${e.message}`)
+    log(`批量領取失敗: ${e.message}`)
+    console.error(e)
   }
 }
 

@@ -602,18 +602,18 @@ async def build_refund_tx(contract):
     return tx.serialize(), msg
 
 async def build_batch_win_tx(user_pubkey):
-    """ 構建批量領取交易 (Batch Claim) """
+    """ 構建批量領取交易 (Batch Claim) - 改良版: 回傳 PSBT 所需資訊 """
     # 1. 找出該用戶所有等待簽名的合約
     contracts = db_get_contracts_by_user(user_pubkey)
     waiting_contracts = [c for c in contracts if c['status'] == 'WAITING_USER_SIG']
     
     if not waiting_contracts:
-        return None, "No waiting contracts found"
+        return None, "No waiting contracts found", []
 
     # 2. 準備 Inputs
     tx_inputs = []
     total_in = 0
-    input_details = [] # 用來暫存每個 Input 對應的簽名資訊
+    psbt_inputs_data = [] # 儲存給前端組裝 PSBT 的詳細資訊
     
     # 假設所有合約都匯款到同一個 User Address (由 Pubkey 衍生)
     user_addr_obj = PublicKey(user_pubkey).get_segwit_address()
@@ -634,63 +634,94 @@ async def build_batch_win_tx(user_pubkey):
         tweak = int.from_bytes(root_hash, 'big')
         tweaked_pubkey, parity = tweak_taproot_pubkey(internal_pub_bytes, tweak)
         
-        tr_addr = P2trAddress(witness_program=tweaked_pubkey[:32].hex())
-        utxo_script_pubkey = tr_addr.to_script_pub_key()
-        
+        # 驗證地址一致性 (Critical Check)
+        reconstructed_address = P2trAddress(witness_program=tweaked_pubkey[:32].hex()).to_string()
+        if reconstructed_address != contract['deposit_address']:
+            print(f"CRITICAL ERROR: Contract {contract['id']} address mismatch!")
+            print(f"DB: {contract['deposit_address']}")
+            print(f"Calc: {reconstructed_address}")
+            continue # 跳過壞掉的合約，避免整批失敗
+
         # 取得 Win 分支的 Control Block
         cb = ControlBlock(internal_pub, tree, 0, is_odd=(parity == 1))
         
+        # 計算 TapLeafHash (用於 PSBT 簽名對應)
+        leaf_hash = tapleaf_tagged_hash(script_win)
+
+        tr_addr = P2trAddress(witness_program=tweaked_pubkey[:32].hex())
+        utxo_script_pubkey = tr_addr.to_script_pub_key()
+        
         for utxo in utxos:
+            # Input 去重
+            if any(inp.txid == utxo['txid'] and inp.txout_index == utxo['vout'] for inp in tx_inputs):
+                continue
+
             tx_inputs.append(TxInput(utxo['txid'], utxo['vout']))
             total_in += utxo['value']
-            # 儲存簽名所需的資訊
-            input_details.append({
+            
+            # 儲存簽名所需的資訊 (不包含簽名，稍後計算)
+            psbt_inputs_data.append({
                 'amount': utxo['value'],
-                'script_pubkey': utxo_script_pubkey,
+                'script_pubkey_hex': utxo_script_pubkey.to_hex(),
+                'tap_internal_key_hex': internal_pub.to_hex(),
+                'tap_merkle_root_hex': root_hash.hex(),
                 'script_win': script_win,
-                'control_block': cb
+                'control_block': cb,
+                'leaf_hash_hex': leaf_hash.hex(),
+                'oracle_pubkey_hex': to_x_only(ORACLE_PUB_KEY_HEX)
             })
 
     if not tx_inputs:
-        return None, "No funds found in waiting contracts"
+        return None, "No funds found in waiting contracts", []
 
     # 3. 計算手續費與輸出
-    # 估算: 每個 Input 約 150 vbytes (Taproot Script Path) + Overhead
     est_vbytes = (len(tx_inputs) * 150) + 31 + 11
     fee = int(est_vbytes * 2.0)
     send_amount = total_in - fee
     
     if send_amount <= 0:
-        return None, "Insufficient funds for fee"
+        return None, "Insufficient funds for fee", []
         
     tx_output = TxOutput(send_amount, user_addr_obj.to_script_pub_key())
-    tx = Transaction(tx_inputs, [tx_output], has_segwit=True)
     
-    # 4. 對每個 Input 進行 Oracle 簽名
-    user_x = to_x_only(user_pubkey)
-    oracle_x = to_x_only(ORACLE_PUB_KEY_HEX)
-    pubkeys = sorted([user_x, oracle_x])
+    # 建立未簽名交易 (Unsigned Transaction)
+    # 注意: 這裡不設 has_segwit=True，因為還沒有 Witness，這樣序列化出來的是 Legacy 格式 (無 Marker/Flag)
+    # bitcoinjs-lib 可以解析 Legacy 格式並轉為 Transaction 物件
+    tx = Transaction(tx_inputs, [tx_output], has_segwit=False)
+    unsigned_tx_hex = tx.serialize()
     
-    for i, detail in enumerate(input_details):
+    # 4. 對每個 Input 進行 Oracle 簽名，並準備回傳資料
+    final_inputs_payload = []
+    
+    # 為了簽名，我們需要一個有 SegWit 結構的 Transaction 物件 (但不需要序列化它)
+    # 其實 sign_taproot_input 內部會處理 sighash，它需要的是 tx 物件
+    # 我們用 has_segwit=True 的版本來簽名，確保結構正確
+    tx_for_signing = Transaction(tx_inputs, [tx_output], has_segwit=True)
+
+    for i, data in enumerate(psbt_inputs_data):
         # Oracle 簽名
         sig_oracle = ORACLE_PRIV_KEY.sign_taproot_input(
-            tx, i, [detail['script_pubkey']], [detail['amount']],
-            script_path=True, tapleaf_script=detail['script_win'], tweak=False
+            tx_for_signing, i, [Script(data['script_pubkey_hex'])], [data['amount']],
+            script_path=True, tapleaf_script=data['script_win'], tweak=False
         )
         
-        sigs_map = { oracle_x: sig_oracle }
-        
-        witness_stack = []
-        for pk in reversed(pubkeys):
-            if pk in sigs_map:
-                witness_stack.append(sigs_map[pk])
-            else:
-                witness_stack.append("") # User 簽名留空
-                
-        witness_elements = witness_stack + [detail['script_win'].to_hex(), detail['control_block'].to_hex()]
-        tx.witnesses.append(TxWitnessInput(witness_elements))
-        
-    return tx.serialize(), f"Batch transaction for {len(waiting_contracts)} contracts created."
+        final_inputs_payload.append({
+            "index": i,
+            "value": data['amount'],
+            "scriptPubKey": data['script_pubkey_hex'],
+            "tapLeafScript": {
+                "controlBlock": data['control_block'].to_hex(),
+                "script": data['script_win'].to_hex(),
+                "leafVersion": 192 # 0xc0
+            },
+            "oracleSig": {
+                "pubkey": data['oracle_pubkey_hex'],
+                "signature": sig_oracle,
+                "leafHash": data['leaf_hash_hex']
+            }
+        })
+
+    return unsigned_tx_hex, f"Batch transaction for {len(waiting_contracts)} contracts created.", final_inputs_payload
 
 # --- 4. API 介面 ---
 
@@ -762,13 +793,16 @@ def get_user_contracts(user_pubkey: str):
 async def claim_all_wins(req: ClaimAllRequest):
     """ 批量領取所有獲勝合約 """
     try:
-        tx_hex, msg = await build_batch_win_tx(req.user_pubkey)
-        if not tx_hex:
+        # 注意：這裡回傳的參數變了
+        unsigned_tx_hex, msg, psbt_inputs = await build_batch_win_tx(req.user_pubkey)
+        
+        if not unsigned_tx_hex:
              return {"status": "error", "message": msg}
              
         return {
             "status": "ready_to_sign",
-            "tx_hex": tx_hex,
+            "unsigned_tx_hex": unsigned_tx_hex, # 未簽名交易
+            "psbt_inputs": psbt_inputs,         # PSBT 組裝說明書
             "message": msg
         }
     except Exception as e:
